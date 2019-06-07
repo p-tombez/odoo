@@ -10,6 +10,9 @@ import operator
 import os
 import re
 
+from collections import defaultdict
+from itertools import tee
+
 from odoo import api, fields, models
 from odoo.tools.translate import _
 from odoo.tools.mimetypes import guess_mimetype
@@ -643,6 +646,59 @@ class Import(models.TransientModel):
         return data
 
     @api.multi
+    def _check_external_ids(self, data, import_fields):
+        messages = []
+        if 'id' in import_fields:
+            imd = self.env['ir.model.data']
+            imm = self.env['ir.module.module']
+            valid_names = ['__import__', '__export__', '__setup__']
+            id_idx = import_fields.index('id')
+
+            data_to_check = (l[id_idx] for l in data)
+            to_check = (e.split('.') for e in data_to_check if '.' in e)
+            iter_excluded = tee(e for e in to_check if e[0] not in valid_names)
+            dict_args = defaultdict(list)
+            domain = []
+
+            for module, name in iter_excluded[0]:
+                dict_args[module].append(name)
+
+            existing_modules = imm.search([('name', 'in', list(dict_args.keys()))])
+            for name in set(dict_args.keys()) - set(existing_modules.mapped('name')):
+                messages.append({
+                    'type': 'warning',
+                    'record': False,
+                    'message':
+                        _("Column 'id' contains an external ID "
+                          "referencing a non-existent module. "
+                          "This could potentially lead to the deletion of "
+                          "the record if a module with "
+                          "the same name is installed. (name: %s)") % name
+                })
+                dict_args.pop(name)
+
+            for module, names in dict_args.items():
+                domain += ['&', ('module', '=', module), ('name', 'in', names)]
+
+            if domain:
+                domain = (['|'] * int(len(domain) / 3 - 1)) + domain
+                res = imd.search(domain)
+                for module, name in iter_excluded[1]:
+                    model_data = res.filtered(lambda r: r.module == module and r.name == name)
+
+                    if not model_data:
+                        messages.append({
+                            'type': 'error',
+                            'record': False,
+                            'message':
+                                _("Column 'id' contains an external ID "
+                                  "subject to deletion in case of module reload "
+                                  "(id: %s.%s). "
+                                  "Please use any of the following: %s") % (module, name, ' or '.join(list(map(lambda e: '%s.%s' % (e, name), valid_names))))
+                        })
+        return messages
+
+    @api.multi
     def do(self, fields, options, dryrun=False):
         """ Actual execution of the import
 
@@ -668,6 +724,9 @@ class Import(models.TransientModel):
 
         try:
             data, import_fields = self._convert_import_data(fields, options)
+            external_ids_errors = self._check_external_ids(data, import_fields)
+            if external_ids_errors:
+                return external_ids_errors
             # Parse date and float field
             data = self._parse_import_data(data, import_fields, options)
         except ValueError as error:
